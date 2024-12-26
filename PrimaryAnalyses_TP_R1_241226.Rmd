@@ -1,0 +1,413 @@
+---
+title: "BDLONG FC Processing & Analysis"
+author: "Danella Hafeman"
+date: "12/26/2024"
+output: html_document
+modifications: This code includes primary analyses for the Translational Psychiatry paper
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse) #for everything
+library(reshape2) #for melt
+library(here)
+library(lme4) #glmer for dichotomous outcome
+library(lmerTest) #return p-values from lmer
+library(rstanarm) #Bayesian methods, given that most "correct" models are not converging
+library(ggplot2) #plots
+library(pROC) #calculated ROC stats
+
+summarize<-dplyr::summarize
+select<-dplyr::select
+```
+
+```{r import covariate datasets}
+
+#intermediate files
+out_dir <- here("data", "intermediate_files")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+#data directories
+out_dir_shen_FC<-"C:/Users/hafemand/OneDrive - University of Pittsburgh/Documents/fMRI/results/BDLONG/parcellations/shen_correlation_230826_individualmasked/txt"
+
+#include only nodes of interest
+shen_coverage<-as.integer(t(read.csv("C:/Users/hafemand/OneDrive - University of Pittsburgh/Documents/fMRI/results/BDLONG/parcellations/shen_coverage_90_230826.csv",header=FALSE)))
+
+shen_parcellation<-read.csv("C:/Users/hafemand/OneDrive - University of Pittsburgh/Documents/fMRI/atlas/Shen_268/shen_parcellation_description.csv")
+
+#important covariate data
+#list that includes dataframes: "covariates_sub" "covariates_ses" "ses_pair_diff"  "ses_mean_diff"
+covariate_out<-readRDS(sprintf("%s/covariate_out_241123.RData",out_dir))
+
+```
+
+Functions: extract shen FC; create datasets
+```{r functions}
+
+################################################################################
+#Import shen FC data
+shen_new_FC<-function(out_dir_shen_FC,parc,task_name) {
+  
+  #list task files
+  task_both<-data.frame(filename=list.files(out_dir_shen_FC,pattern=task_name))
+  task_both %>% 
+    mutate(sub=substr(filename,1,7),
+           ses=substr(filename,9,14),
+           task=substr(filename,21,nchar(filename)-10)) ->task_list
+  #list sessions
+  task_list %>%
+    select(sub,ses)%>%
+    group_by(sub,ses) %>%
+    summarize(count=n())->ses_list
+  #list subjects
+  ses_list %>%
+    group_by(sub) %>%
+    summarize(count=n())->sub_list
+  
+  #create output df
+  corr_out=data.frame(matrix(ncol =0, nrow = parc*(parc-1)/2))
+  
+  for (h in 1:nrow(sub_list)) {
+    ses_list %>% filter(sub==sub_list$sub[h])->ses_spec
+    corr_sub=data.frame(matrix(ncol =0, nrow = parc*(parc-1)/2))
+    out_labels=vector()
+    
+    for (i in 1:nrow(ses_spec)) {
+      #identifies files with specific sub/session
+      task_list %>% filter(sub==sub_list$sub[h],ses==ses_spec$ses[i])->task_spec
+      corr_ses=data.frame(matrix(ncol =0, nrow = parc*(parc-1)/2))
+
+      out_labels <-append(out_labels,sprintf('%s_%s',sub_list$sub[h],ses_spec$ses[i]))
+    
+      #imports correlation table for each task
+      for (j in 1:nrow(task_spec)) {
+        name<-sprintf('%s/%s',out_dir_shen_FC,task_spec$filename[j]) 
+        corrtable<-read.csv(name,header=FALSE)
+
+        #linearizes upper triangle
+        corr_ses<-cbind(corr_ses,corrtable[upper.tri(corrtable)])
+      }
+      #takes mean of upper triangles (across tasks) and binds to sub
+      corr_sub<-cbind(corr_sub,rowMeans(corr_ses))
+    }
+    colnames(corr_sub)<-out_labels
+    corr_out<-cbind(corr_out,corr_sub)
+  }
+  return(corr_out)
+  
+}
+##############################################################################
+
+#create datasets
+create_datasets<-function(measure,node_list,varname) {
+  out_list<-list()
+  #if FC measure, create upper triangle of outer matrix (both nodes in the list); otherwise, just list nodes 
+  if (grepl("FC", varname)) {
+    included_nodes<- outer(node_list,node_list)[upper.tri(outer(node_list,node_list))]
+    } else {
+    included_nodes<-node_list
+    }
+  out_temp<-cbind(included_nodes,measure)
+  out_temp %>%
+    filter(included_nodes==1) %>%
+    select(-included_nodes)->out_list$raw
+
+  out_list$pearson<- cor(out_list$raw,use="complete.obs")
+  #out_list$cosine <- cosine(as.matrix(na.omit(corr_out)))
+  #out_list$manhattan <- manhattan(as.matrix(na.omit(corr_out)))
+  
+  #puts in format for ggplot
+  out_list$pearson_melted <- melt(out_list$pearson)
+  #out_list$cosine_melted <- melt(out_list$cosine)
+  #out_list$manhattan_melted <- melt(out_list$manhattan) 
+  
+  names(out_list$pearson_melted)[names(out_list$pearson_melted) == 'value'] <- varname
+  
+  out_list$pearson_melted %>%
+    mutate(sub1=substr(Var1,5,7),
+           sub2=substr(Var2,5,7),
+           ses1=substr(Var1,14,14),
+           ses2=substr(Var2,14,14)) %>%
+    relocate(Var1,Var2,sub1,sub2,ses1,ses2)->out_list$pearson_melted
+  
+  out_list$pearson_melted %>%
+    filter(sub1==sub2,ses1<ses2) %>%
+    relocate(sub=sub1,ses1,ses2) %>%
+    select(-Var1,-Var2,-sub2)->out_list$pearson_melted_within_sub
+  
+  return(out_list)
+}
+
+####################################################################################################
+
+#generates model formula for Bayesian models
+model_formula <- function(dependent_var, primary_vars, covariates, nesting_var = "(1|ses_1:sub) + (1|ses_2:sub) + (1|ses_3:sub) + (1|ses_4:sub) + (1|ses_5:sub) + (1|ses_6:sub) + (1|sub)") {
+  # Convert primary_vars and covariates to formula components
+  
+  primary_vars_str <- paste(primary_vars, collapse = " + ")
+  covariates_str <- paste(covariates, collapse = " + ")
+
+  # Build the full formula as a string
+  formula_str <- paste0(
+    dependent_var, " ~ ",
+    primary_vars_str,
+    if (nchar(covariates_str) > 0) paste0(" + ", covariates_str) else "",
+    " + ", nesting_var
+  )
+
+  # Convert the formula string to a formula object
+  model_formula <- as.formula(formula_str)
+  environment(model_formula)<-parent.frame()
+
+  return(model_formula)
+}
+
+#####################################################################################################################
+
+#create plot for BD vs. HC
+create_custom_scatter_plot <- function(data, x_var="sub", y_var, fill_var="BD", x_label = "Subject", y_label = "Correlation Similarity", fill_label = "Group") {
+  
+  data[[fill_var]] <- as.factor(data[[fill_var]])
+  
+  # Create the ggplot object
+  scatter_plot <- ggplot(data, aes_string(x = x_var, y = y_var,color=fill_var)) + 
+    geom_point() +
+    #geom_rect(aes_string(xmin = x_var, 
+    #                     xmax = paste0("dplyr::lead(", x_var, ")"), 
+    #                     ymin = paste0("min(", y_var, ")"), 
+    #                     ymax = "Inf", 
+    #                     fill = fill_var), 
+    #          alpha = 0.5) +
+    stat_summary(fun = mean, geom = 'crossbar') +
+    #scale_color_discrete(name = fill_label,labels = c("Healthy Control", "Bipolar Disorder") ) +
+    scale_color_manual(name = fill_label, 
+                       values = c("0" = "blue", "1" = "red"),  # Switch blue and red
+                       labels = c("Healthy Control", "Bipolar Disorder")) + 
+    xlab(x_label) +
+    ylab(y_label)
+  
+  
+  return(scatter_plot)
+}
+
+#####################################################################################################################
+
+#scatter plot to look at linear relationships
+linear_relationships_plot <- function(data, x_var, y_var, subject_var="sub", x_label = "X-axis", y_label = "Y-axis", color_label = "Subject") {
+  
+  # Ensure subject_var is a factor for color mapping
+  data[[subject_var]] <- as.factor(data[[subject_var]])
+  
+  # Calculate y-axis limits based on the min and max of y_var
+  y_limits <- c(min(data[[y_var]], na.rm = TRUE), max(data[[y_var]], na.rm = TRUE))
+  
+  # Create the ggplot object
+  scatter_plot <- ggplot(data, aes_string(x = x_var, y = y_var)) +
+    geom_point(aes(color = factor(.data[[subject_var]]))) +  # Color points by subject
+    coord_cartesian(ylim = y_limits) +  # Dynamically set y-axis limits
+    geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add overall linear regression line
+    #geom_smooth(method = "lm", se = FALSE, aes(color = factor(.data[[subject_var]])), linetype = "dashed") +  # Add separate regression lines for each subject
+    labs(x = x_label, y = y_label) +
+    scale_colour_discrete(name = color_label)  # Create a legend for the color
+  
+  return(scatter_plot)
+}
+
+
+```
+
+
+```{r import Shen FC data and join with covariate data}
+
+#import Shen functional connectomes in directory
+raw<-shen_new_FC(out_dir_shen_FC,268,"(inscapes|rest)")
+
+#return list of mood-related nodes that also have good coverage
+NOI_nodes<-shen_parcellation$reward_network*shen_coverage
+
+out<-list()
+
+#run function to create NOI and wb datasets
+out$NOI<-create_datasets(raw,NOI_nodes,"FC_all_NOI")
+out$wb<-create_datasets(raw,shen_coverage,"FC_all_wb")
+
+```
+
+
+```{r create datasets}
+
+#create within_vs_between (subject-level) dataset
+within_vs_between1<-full_join(out$wb$pearson_melted,out$NOI$pearson_melted,by=c("sub1","sub2","ses1","ses2"))
+within_vs_between<-within_vs_between1 %>%
+  mutate(same_sub=ifelse(sub1==sub2,1,0))%>%
+  filter(sub1!=sub2|ses1<ses2) %>%
+  group_by(sub1,same_sub) %>%
+  summarize(FC_all_wb=mean(FC_all_wb),FC_all_NOI=mean(FC_all_NOI))
+  
+#pairwise comparisons
+ses_pair1<-full_join(out$NOI$pearson_melted_within_sub,out$wb$pearson_melted_within_sub,by=c("sub","ses1","ses2")) #join NOI and wb datasets
+ses_pair<-left_join(ses_pair1,covariate_out$ses_pair_diff,by=c("sub","ses1","ses2"))
+
+#create scaled variables for covariates (added due to lack of convergence)
+ses_pair[, c("time_diff_scaled","date_diff_scaled","FD_mean_scaled")] <- scale(ses_pair[, c("time_diff","date_diff","FD_mean")])
+
+ses_pair_BD<-ses_pair %>% filter (BD==1)
+
+#make BD subtype into a factor
+ses_pair$BD_type_factor<-as.factor(ses_pair$BD_type)
+ses_pair_BD <- ses_pair %>%
+  filter(BD==1)
+ses_pair_BD$BD_type_factor<-as.factor(ses_pair_BD$BD_type)
+
+#subsets with (1) no m
+ses_pair %>% filter(mood_pole_diff<20|BD==0)->ses_pair_noman #removing all manic and mixed (20, 21, 22, 30, 31, 32) (66 observations)
+ses_pair %>% filter(same_mood==1|BD==0)->ses_pair_samemood #same mood
+
+#subject-level comparisons
+sub_mean_stability1<-ses_pair1 %>%
+  group_by(sub) %>%
+  summarize(mean_FC_all_NOI=mean(FC_all_NOI), mean_FC_all_wb=mean(FC_all_wb))
+sub_mean_stability<-left_join(sub_mean_stability1,covariate_out$covariates_sub,by="sub")
+
+sub_mean_stability_noman <-ses_pair_noman %>%
+  group_by(sub) %>%
+  summarize(mean_FC_all_NOI=mean(FC_all_NOI), mean_FC_all_wb=mean(FC_all_wb), BD=mean(BD))
+
+
+```
+
+```{r Within vs. Between-Person Scan Pair Similarity}
+
+#Figure 1a: Within vs. between NOI
+ggheatmap <- ggplot(out$NOI$pearson_melted, aes(Var1, Var2, fill = FC_all_NOI))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0.55, limit = c(0.25,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_blank(), axis.text.y = element_blank())+
+ coord_fixed()
+# Print the heatmap
+print(ggheatmap)
+
+#Figure 1b: Within vs. between whole-brain
+ggheatmap <- ggplot(out$wb$pearson_melted, aes(Var1, Var2, fill = FC_all_wb))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0.55, limit = c(0.25,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_blank(), axis.text.y = element_blank())+
+ coord_fixed()
+# Print the heatmap
+print(ggheatmap)
+
+#t-tests (same sub vs. different sub, conducted within subject)
+t.test(within_vs_between$FC_all_NOI~within_vs_between$same_sub)
+t.test(within_vs_between$FC_all_wb~within_vs_between$same_sub)
+
+
+```
+
+```{r Within-Person Scan-Pair Stability in BD vs. HC}
+
+#covariates
+covariates_scaled <- c("time_diff_scaled","date_diff_scaled","FD_mean_scaled")
+
+#formulas
+NOI_BD_formula<-model_formula(dependent_var="FC_all_NOI",primary_vars="BD", covariates_scaled)
+wb_BD_formula<-model_formula(dependent_var="FC_all_wb",primary_vars="BD", covariates_scaled)
+
+#run Bayesian models
+
+#NOI
+set.seed(123)
+NOI<- stan_lmer(NOI_BD_formula, data = ses_pair)
+summary(NOI, pars ="BD",probs = c(0.025, 0.975),digits = 3)
+
+#WB
+set.seed(123)
+wb<- stan_lmer(wb_BD_formula, data = ses_pair)
+summary(wb, pars ="BD",probs = c(0.025, 0.975),digits = 3)
+
+#NOI - Figure 2
+print(create_custom_scatter_plot(ses_pair, y_var = "FC_all_NOI"))
+
+#NOI - Models at subject level
+wilcox.test(sub_mean_stability$mean_FC_all_NOI~sub_mean_stability$BD) 
+
+#NOI - ROC analyses (AUC,optimal threshold)
+auc<-round(auc(sub_mean_stability$BD, sub_mean_stability$mean_FC_all_NOI),4)
+print(auc)
+roc1 <- roc(sub_mean_stability$BD, sub_mean_stability$mean_FC_all_NOI)
+print(coords(roc1, x="best", input="threshold", best.method="youden"))
+
+
+#WB - Basic model - at subject level
+wilcox.test(sub_mean_stability$mean_FC_all_wb~sub_mean_stability$BD) 
+
+
+```
+
+```{r Mood Symptoms/State and Within-Person Scan-Pair Stability }
+
+##EFFECT OF MOOD
+
+NOI_mood_formula<-model_formula(dependent_var="FC_all_NOI",primary_vars=c("ymrs_mean","madrs_mean"), covariates_scaled)
+wb_mood_formula<-model_formula(dependent_var="FC_all_wb",primary_vars=c("ymrs_mean","madrs_mean"), covariates_scaled)
+
+#NOI
+set.seed(123)
+NOI_mood<- stan_lmer(NOI_mood_formula, data = ses_pair_BD)
+summary(NOI_mood, pars =c("ymrs_mean","madrs_mean"),probs = c(0.025, 0.975),digits = 4)
+
+print(linear_relationships_plot(ses_pair_BD, x_var = "ymrs_mean", 
+                                          y_var = "FC_all_NOI", x_label = "Mean YMRS Score (Across Scan Pair)", 
+                                          y_label = "Correlation Similarity"))
+
+
+#WB
+set.seed(123)
+wb_mood<- stan_lmer(wb_mood_formula, data = ses_pair_BD,chains=6)
+summary(wb_mood, pars =c("ymrs_mean","madrs_mean"),probs = c(0.025, 0.975),digits = 5)
+
+##EFFECT OF BD IN SUBSET (1) WITH NO MANIC SYMPTOMS and (2) SIMILAR MOOD
+
+#NOI - no manic symptoms
+set.seed(123)
+NOI_BD_noman<- stan_lmer(NOI_BD_formula, data = ses_pair_noman)
+summary(NOI_BD_noman, pars ="BD",probs = c(0.025, 0.975),digits = 3)
+
+#sub_level - no manic symptoms
+#Basic model - at subject level
+wilcox.test(sub_mean_stability_noman$mean_FC_all_NOI~sub_mean_stability_noman$BD) 
+
+#ROC analyses
+auc<-round(auc(sub_mean_stability_noman$BD, sub_mean_stability_noman$mean_FC_all_NOI),4)
+auc
+
+
+#NOI - same mood
+set.seed(123)
+NOI_BD_samemood<- stan_lmer(NOI_BD_formula, data = ses_pair_samemood)
+summary(NOI_BD_samemood, pars ="BD",probs = c(0.025, 0.975),digits = 3)
+
+
+```
+
+```{r Effect of Bipolar Subtype}
+
+NOI_BDtype_formula<-model_formula(dependent_var="FC_all_NOI",primary_vars="BD_type_factor", covariates_scaled)
+
+#NOI - BD subtype (BDI vs. HC, BDII vs. HC)
+set.seed(123)
+NOI_BDtype1<- stan_lmer(NOI_BDtype_formula, data = ses_pair)
+summary(NOI_BDtype1, pars =c("BD_type_factor1","BD_type_factor2"),probs = c(0.025, 0.975),digits = 3)
+
+#NOI - BD 
+set.seed(123)
+NOI_BDtype2<- stan_lmer(NOI_BDtype_formula, data = ses_pair_BD, chains=6)
+summary(NOI_BDtype2, pars =c("BD_type_factor2"),probs = c(0.025, 0.975),digits = 3)
+summary(NOI_BDtype2, pars =c("BD_type_factor2"),probs = c(0.05, 0.95),digits = 3)
+
+```
